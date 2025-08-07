@@ -1,0 +1,153 @@
+!pip install google-generativeai
+!pip install pillow
+!pip install pytesseract
+!pip install pdf2image
+
+import os
+import json
+import re
+from PIL import Image
+import pytesseract
+from pdf2image import convert_from_path
+import google.generativeai as genai
+from collections import defaultdict
+
+pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+poppler_path = r"C:/Users/LENOVO/Desktop/Release-24.08.0-0/poppler-24.08.0/Library/bin"
+folder_path = r"C:\Users\LENOVO\Desktop\menu_uploads"
+
+# Supported extensions
+image_exts = ('.png', '.jpg', '.jpeg')
+pdf_exts = ('.pdf',)
+
+# Get all files in folder
+all_files = os.listdir(folder_path)
+
+# Dynamically find the first image and pdf
+image_file = next((f for f in all_files if f.lower().endswith(image_exts)), None)
+pdf_file = next((f for f in all_files if f.lower().endswith(pdf_exts)), None)
+
+def extract_text_from_file(file_path):
+    text = ""
+    if file_path.lower().endswith(image_exts):
+        img = Image.open(file_path)
+        text = pytesseract.image_to_string(img)
+    elif file_path.lower().endswith('.pdf'):
+        pages = convert_from_path(file_path, poppler_path=poppler_path)
+        for page in pages:
+            text += pytesseract.image_to_string(page)
+    return text
+
+def parse_menu(text):
+    data = defaultdict(list)
+    current_category = None
+    lines = text.splitlines()
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+
+        # Detect UPPERCASE category titles
+        if line.isupper() and len(line) > 2:
+            current_category = line
+            continue
+
+        # Try strict match: item and price
+        match = re.match(r"(.+?)\s+(?:₹|Rs\.?|INR)?\s*(\d{2,5})\s*/?-?$", line, re.IGNORECASE)
+        if match and current_category:
+            item = match.group(1).strip()
+            price = int(match.group(2))
+            data[current_category].append({"item": item, "price": price})
+        else:
+            # Fallback: Try to find a number anywhere at end
+            fallback_match = re.search(r"(.+?)\s+(?:₹|Rs\.?|INR)?\s*(\d{2,5})", line, re.IGNORECASE)
+            if fallback_match and current_category:
+                item = fallback_match.group(1).strip()
+                price = int(fallback_match.group(2))
+                data[current_category].append({"item": item, "price": price})
+            elif current_category:
+                # No price found, just store item name
+                data[current_category].append({"item": line, "price": None})
+
+    return dict(data)
+
+def clean_ocr_text(text):
+    lines = text.splitlines()
+    cleaned = []
+    for line in lines:
+        line = re.sub(r"[^\w\s₹Rs./-]", "", line)  # remove non-alphanumeric symbols
+        line = re.sub(r"\.{2,}", "", line)         # remove long dotted lines
+        line = re.sub(r"\s{2,}", " ", line)        # collapse multiple spaces
+        if line.strip() and not any(x in line.lower() for x in ["gst", "subject to", "enquire"]):
+            cleaned.append(line.strip())
+    return "\n".join(cleaned)
+
+# Process image
+image_data = {}
+if image_file:
+    image_path = os.path.join(folder_path, image_file)
+    print(f"Processing image: {image_path}")
+    image_text = extract_text_from_file(image_path)
+    image_data = parse_menu(image_text)
+else:
+    print("❌ No image file found.")
+
+# Process PDF
+pdf_data = {}
+if pdf_file:
+    pdf_path = os.path.join(folder_path, pdf_file)
+    print(f"Processing PDF: {pdf_path}")
+    pdf_text = extract_text_from_file(pdf_path)
+    pdf_data = parse_menu(pdf_text)
+else:
+    print("❌ No PDF file found.")
+
+# Final output
+final_output = {
+    "image_data": image_data,
+    "pdf_data": pdf_data
+}
+
+print(json.dumps(final_output, indent=2, ensure_ascii=False))
+
+# Set your Gemini API key
+genai.configure(api_key="AIzaSyCMaQy13EXktTRQM8x244tCZBveHExQdwI")
+
+# Load Gemini model
+model = genai.GenerativeModel(model_name="models/gemini-2.5-flash")
+
+def format_menu(image_data, pdf_data):
+    # Prompt to get structured menu data
+    prompt = f"""
+    You are a menu parsing assistant.
+    
+   Given this menu text, return structured JSON like:
+[
+  {{
+    "name": "Dish Name",
+    "price": 120,
+    "isVeg": true,
+    "foodType": "veg",  // or "nonveg"
+    "category": "starter", // or "main course", "dessert", "beverage", etc.
+  }}
+]
+    
+    Rules:
+    - Carefully identify the item name.
+    - Extract the numeric price (ignore ₹ or Rs).
+    - Use your best judgment to assign 'isVeg': true/false based on dish name.
+    - Categorize items into 'Starter', 'Main Course', 'Beverage', etc., if possible.
+    
+    Text to parse:
+    \"\"\"{pdf_data}\"\"\"
+    """
+
+    response = model.generate_content(prompt)
+    text = response.text.strip()
+    pdfVal = [dish.strip() for dish in text.split(",")]
+    return pdfVal
+
+# Test
+opt = format_menu(image_data, pdf_data)
+print(opt)
