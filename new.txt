@@ -1,0 +1,443 @@
+!pip install google-generativeai
+!pip install pillow
+!pip install pytesseract
+!pip install pdf2image
+!pip install opencv-python
+
+#imports for sentence-transformer
+!pip install -U sentence-transformers 
+!pip install requests
+!pip install google-cloud-aiplatform
+
+#imports
+import cv2
+import numpy as np
+import re
+import requests
+import os
+import json
+from PIL import Image
+import pytesseract
+from pdf2image import convert_from_path
+from pydantic import BaseModel
+from typing import Optional
+from vertexai.generative_models import GenerativeModel
+import vertexai
+import google.auth
+import google.auth.transport.requests
+from sentence_transformers import SentenceTransformer, util
+from datetime import datetime
+from google.cloud import aiplatform
+
+# ==== CONFIG ====
+
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "C:/Users/LENOVO/Desktop/ocr/ai-hackathon.json"
+
+from google.cloud import aiplatform
+aiplatform.init(
+    project="twinleaves-dev",      
+    location="us-central1"           
+)
+folder_path = r"C:\Users\LENOVO\Desktop\menu_uploads"
+
+vertexai.init(project="twinleaves-dev", location="us-central1")
+
+pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+poppler_path = r"C:/Users/LENOVO/Desktop/Release-24.08.0-0/poppler-24.08.0/Library/bin"
+
+image_exts = ('.png', '.jpg', '.jpeg')
+pdf_exts = ('.pdf',)
+
+# ==== Step 1: OCR with Pre-processing ====
+def preprocess_image(image_path):
+    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    img = cv2.threshold(img, 150, 255, cv2.THRESH_BINARY)[1]  # Binarize
+    img = cv2.medianBlur(img, 3)  # Reduce noise
+    return img
+
+def extract_text_from_file(file_path):
+    text = ""
+    if file_path.lower().endswith(image_exts):
+        img = preprocess_image(file_path)
+        text = pytesseract.image_to_string(img, config='--oem 3 --psm 6')
+    elif file_path.lower().endswith('.pdf'):
+        pages = convert_from_path(file_path, poppler_path=poppler_path)
+        for page in pages:
+            # Convert PIL to OpenCV
+            page_cv = cv2.cvtColor(np.array(page), cv2.COLOR_RGB2BGR)
+            page_gray = cv2.cvtColor(page_cv, cv2.COLOR_BGR2GRAY)
+            page_bin = cv2.threshold(page_gray, 150, 255, cv2.THRESH_BINARY)[1]
+            text += pytesseract.image_to_string(page_bin)
+    return text
+
+# ==== Step 2: Clean Non-Menu Text ====
+STOPWORDS = [
+    "tax", "service charge", "lunch only", "dinner only",
+    "per person", "enquire", "gst", "offer", "discount"
+]
+
+def clean_menu_text(raw_text):
+    lines = raw_text.split("\n")
+    cleaned_lines = []
+    for line in lines:
+        line_stripped = line.strip()
+        if not line_stripped:
+            continue
+        # Drop stopword lines
+        if any(word in line_stripped.lower() for word in STOPWORDS):
+            continue
+        # Keep if contains price
+        if re.search(r"\b\d+(\.\d{1,2})?\b", line_stripped):
+            cleaned_lines.append(line_stripped)
+    return "\n".join(cleaned_lines)
+
+# ==== Step 3: Vertex AI Call ====
+class MenuItem(BaseModel):
+    name: str
+    category: Optional[str]
+    price: Optional[float]
+    isVeg: bool
+    description: Optional[str] = ""
+
+def get_access_token():
+    # Request the correct Vertex AI scope
+    creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+    auth_req = google.auth.transport.requests.Request()
+    creds.refresh(auth_req)
+    return creds.token
+
+def parse_with_vertex(clean_text):
+    prompt = f"""
+Extract menu items from the text below into valid JSON.
+Only include purchasable items with a price.
+
+Format:
+[
+  {{
+    "name": "Item Name",
+    "category": "Category",
+    "price": 180,
+    "isVeg": true,
+    "description": ""
+  }}
+]
+
+Text:
+\"\"\"{clean_text}\"\"\"
+"""
+    access_token = get_access_token()
+    url = "https://us-central1-aiplatform.googleapis.com/v1/projects/twinleaves-dev/locations/us-central1/publishers/google/models/gemini-2.5-flash:generateContent"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {access_token}"
+    }
+    payload = {"contents": [{"role": "user", "parts": [{"text": prompt}]}]}
+    
+    r = requests.post(url, headers=headers, json=payload)
+    r.raise_for_status()
+    
+    output_text = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+    if output_text.startswith(""):
+        output_text = output_text.strip("`").strip()
+        if output_text.lower().startswith("json"):
+            output_text = output_text[4:].strip()
+
+    parsed_json = json.loads(output_text)
+    return [MenuItem(**item).model_dump() for item in parsed_json]
+
+# ==== Step 4: Main ====
+final_output = {}
+for file_name in os.listdir(folder_path):
+    file_path = os.path.join(folder_path, file_name)
+    if file_path.lower().endswith(image_exts + pdf_exts):
+        print(f"Processing: {file_name}")
+        raw_text = extract_text_from_file(file_path)
+        clean_text = clean_menu_text(raw_text)
+        structured_data = parse_with_vertex(clean_text)
+        final_output[file_name] = structured_data
+
+print(json.dumps(final_output, indent=2, ensure_ascii=False))
+
+
+# ==== Step 5: Location & Season ====
+def get_city():
+    try:
+        return requests.get('http://ip-api.com/json').json().get('city')
+    except:
+        return "Mumbai"
+
+def get_season():
+    month = datetime.now().month
+    if month in [3, 4, 5]:
+        return "Spring"
+    elif month in [6, 7, 8]:
+        return "Summer"
+    elif month in [9, 10, 11]:
+        return "Autumn"
+    else:
+        return "Winter"
+
+
+# ==== Step 4: Helper for Vertex AI free text generation ====
+def vertex_generate(prompt: str) -> str:
+    access_token = get_access_token()
+    url = "https://us-central1-aiplatform.googleapis.com/v1/projects/twinleaves-dev/locations/us-central1/publishers/google/models/gemini-2.5-flash:generateContent"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {access_token}"
+    }
+    payload = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": prompt}]
+            }
+        ]
+    }
+    r = requests.post(url, headers=headers, json=payload)
+    r.raise_for_status()
+    output_text = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+    return output_text
+
+# ==== Step 6: Dish Pool from Vertex AI ====
+def get_dishes(city, season):
+    prompt = f"""
+    Give me a list of 10 popular Indian food dishes that are commonly served in restaurants in {city} during {season}.
+    Just return the dish names in a comma-separated list, no explanation.
+    """
+    dish_text = vertex_generate(prompt)
+    return [dish.strip() for dish in dish_text.split(",") if dish.strip()]
+
+# ==== Step 7: SentenceTransformer Suggestions ====
+def get_suggestions(existing_items, dish_pool):
+    model = SentenceTransformer('all-MiniLM-L6-v2')
+    existing_embeddings = model.encode(existing_items, convert_to_tensor=True)
+    pool_embeddings = model.encode(dish_pool, convert_to_tensor=True)
+    suggestions = []
+    for idx, emb in enumerate(pool_embeddings):
+        similarities = util.cos_sim(emb, existing_embeddings)[0]
+        if max(similarities) < 0.6:
+            suggestions.append(dish_pool[idx])
+    return suggestions
+
+# ==== Step 8: Main ====
+final_output = {}
+all_menu_items = []
+
+for file_name in os.listdir(folder_path):
+    file_path = os.path.join(folder_path, file_name)
+    if file_path.lower().endswith(image_exts + pdf_exts):
+        print(f"Processing: {file_name}")
+        raw_text = extract_text_from_file(file_path)
+        clean_text = clean_menu_text(raw_text)
+        structured_data = parse_with_vertex(clean_text)
+        final_output[file_name] = {"menu": structured_data}
+        all_menu_items.extend([item["name"] for item in structured_data])
+
+city = get_city()
+season = get_season()
+dish_pool = get_dishes(city, season)
+suggestions = get_suggestions(all_menu_items, dish_pool)
+
+final_output["suggestions"] = suggestions
+print(json.dumps(final_output, indent=2, ensure_ascii=False))
+
+#Formatting Suggestions:
+city = get_city()
+season = get_season()
+dish_pool = get_dishes(city, season)
+suggestions = get_suggestions(all_menu_items, dish_pool)
+
+# Format suggestions same as menu items
+# final_output["suggestions"] = [
+#     {
+#         "name": suggestion,
+#         "category": "Burger",  # Static value
+#         "price": 250,          # Static value
+#         "isVeg": True,         # Static value
+#         "description": "Suggested Items"  # Static value
+#     }
+#     for suggestion in suggestions
+# ]
+
+suggestions_with_details = []
+for suggestion in suggestions:
+    prompt = f"""
+    Provide the details for the menu item "{suggestion}" in JSON format with the following fields:
+    name, category, price, isVeg (true/false), description.
+    Example:
+    {{
+      "name": "Paneer Butter Masala",
+      "category": "Main Course",
+      "price": 250,
+      "isVeg": true,
+      "description": "Rich tomato-based curry with paneer cubes"
+    }}
+    """
+
+    try:
+        result_text = vertex_generate(prompt)
+        # Clean possible formatting issues from AI output
+        if result_text.startswith("```"):
+            result_text = result_text.strip("`").strip()
+            if result_text.lower().startswith("json"):
+                result_text = result_text[4:].strip()
+        suggestion_json = json.loads(result_text)
+        suggestions_with_details.append(suggestion_json)
+    except Exception as e:
+        # fallback if AI fails
+        suggestions_with_details.append({
+            "name": suggestion,
+            "category": "Misc",
+            "price": 200,
+            "isVeg": True,
+            "description": "Suggested Item"
+        })
+
+final_output["suggestions"] = suggestions_with_details
+
+print(json.dumps(final_output, indent=2, ensure_ascii=False))
+
+from datetime import datetime
+
+# Example variables (replace with your actual values)
+uidx = "USER_123"
+userName = "John Doe"
+orgId = "ORG_456"
+locId = "LOC_789"
+locName = "Main Branch"
+formattedDate = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+payload = []
+
+# Combine menu and suggestions into one list
+combined_items = []
+
+for menu_file, menu_data in final_output.items():
+    if menu_file != "suggestions":
+        combined_items.extend(menu_data["menu"])
+combined_items.extend(final_output["suggestions"])
+
+# Convert each item to your payload format
+for item in combined_items:
+    name = item["name"]
+    price = item["price"]
+
+    payload.append({
+        "productName": name,
+        "action": "product_create",
+        "logType": "Create",
+        "logTime": formattedDate,
+        "loggedBy": uidx,
+        "loggedByName": userName,
+        "sourceId": orgId,
+        "sourceLocationId": locId,
+        "sourceName": locName,
+        "sourceType": "Restaurant",
+        "product": {
+            "id": "",
+            "name": name,
+            "title": name,
+            "appCategories": {
+                "categoryLevel1": [item["category"]],
+                "categoryLevel1Id": [""],
+                "categoryLevel2": [],
+                "categoryLevel2Id": [],
+            },
+            "posCategories": {
+                "categoryLevel1": [item["category"]],
+                "categoryLevel1Id": [""],
+                "categoryLevel2": [],
+                "categoryLevel2Id": [],
+            },
+            "productTypes": ["Menu"],
+            "taxReference": {
+                "taxName": "GST & CESS",
+                "taxType": "GST",
+                "taxCategory": "GST",
+                "taxRate": "18%",
+                "isDefault": True,
+                "metadata": {
+                    "hsnCode": "",
+                    "cess": 1,
+                    "cgst": 9,
+                    "sgst": 9,
+                },
+            },
+            "attributes": {
+                "foodType": "VEG" if item.get("isVeg", True) else "NON_VEG",
+                "vegan": False,
+            },
+            "storeSpecificData": {
+                "storeId": "RET_91",
+                "storeLocationId": "RLC_60",
+                "storeName": "Twinleaves",
+                "storeLocationName": "RET_91",
+            },
+            "variants": [
+                {
+                    "name": name,
+                    "recipeRequest": None,
+                    "addOn": [],
+                    "externalSalesChannels": [
+                        {
+                            "salesChannelName": "DINE_IN",
+                            "deliveryConsumable": [],
+                            "salePrice": price,
+                            "marginPercentage": price,
+                            "profit": price
+                        }
+                    ],
+                    "sku": "5555500081240",
+                    "weight": 1,
+                    "weightUnit": "PSC",
+                    "taxStatus": "TAXABLE",
+                    "minB2COrderQuantity": 1,
+                    "minB2BOrderQuantity": 1,
+                    "minPosOrderQuantity": 1,
+                    "images": [],
+                    "inventorySync": {
+                        "mrp": price,
+                        "sellingPrice": price,
+                        "purchasePrice": price,
+                    },
+                    "sellingUnits": [
+                        {
+                            "quantity": "1",
+                            "unitOfMeasure": "PSC",
+                        },
+                    ],
+                    "weightsAndMeasures": [
+                        {
+                            "measurementUnit": "PSC",
+                            "netWeight": 1,
+                            "grossWeight": 1,
+                            "netContent": 1,
+                            "metadata": {
+                                "type": "PRIMARY",
+                            },
+                        },
+                    ],
+                    "metadata": {
+                        "additionalProp1": "",
+                        "additionalProp2": "",
+                        "additionalProp3": "",
+                    },
+                    "createdBy": "RICHA",
+                    "createdByName": "RICHA",
+                    "isActive": True,
+                    "shortCode": "",
+                },
+            ],
+            "imageUrls": {
+                "front": "",
+            },
+            "createdBy": "RICHA",
+            "createdByName": "RICHA",
+            "updatedBy": "",
+            "updatedByName": "RICHA",
+        },
+    })
+
+# Now payload is your final array
+print(json.dumps(payload, indent=2, ensure_ascii=False))
